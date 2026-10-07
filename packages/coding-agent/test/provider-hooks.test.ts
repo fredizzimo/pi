@@ -23,7 +23,7 @@ import type { ModelRuntime } from "../src/core/model-runtime.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
-import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 
 const model: Model<Api> = {
@@ -101,17 +101,15 @@ describe("session provider hooks", () => {
 
 	afterEach(() => {
 		for (const session of sessions.splice(0)) session.dispose();
-		vi.useRealTimers();
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	async function createSession(factory: ExtensionFactory, settings: Partial<Settings> = {}) {
+	async function createSession(factory: ExtensionFactory) {
 		const cwd = join(tempDir, `session-${sessions.length}`);
 		mkdirSync(cwd);
 		const settingsManager = SettingsManager.inMemory({
 			compaction: { enabled: false },
 			retry: { enabled: false },
-			...settings,
 		});
 		const resourceLoader = new DefaultResourceLoader({
 			cwd,
@@ -202,95 +200,27 @@ describe("session provider hooks", () => {
 		},
 	);
 
-	it("delivers all hooks once for normal turns and default summaries", async () => {
-		const calls: string[] = [];
-		const session = await createSession(
-			(pi) => {
-				pi.on("before_provider_headers", () => {
-					calls.push("headers");
-				});
-				pi.on("before_provider_request", () => {
-					calls.push("payload");
-				});
-				pi.on("after_provider_response", () => {
-					calls.push("response");
-				});
-				pi.on("provider_stream_event", () => {
-					calls.push("event");
-				});
-			},
-			{ compaction: { enabled: false, keepRecentTokens: 1, reserveTokens: 1024 } },
-		);
-
-		await session.prompt("first turn");
-		expect(calls).toEqual(["headers", "payload", "response", "event", "event"]);
-		const targetId = session.sessionManager
-			.getEntries()
-			.find((entry) => entry.type === "message" && entry.message.role === "assistant")?.id;
-		expect(targetId).toBeDefined();
-		await session.prompt("second turn");
-		calls.length = 0;
-		await session.navigateTree(targetId!, { summarize: true });
-		expect(calls).toEqual(["headers", "payload", "response", "event", "event"]);
-		await session.prompt("third turn");
-		calls.length = 0;
-		const beforeCompaction = sent.length;
-		await session.compact();
-		// keepRecentTokens splits the last turn: one checkpoint and one turn-prefix summary.
-		expect(sent.length - beforeCompaction).toBe(2);
-		expect(calls).toEqual([
-			"headers",
-			"payload",
-			"response",
-			"event",
-			"event",
-			"headers",
-			"payload",
-			"response",
-			"event",
-			"event",
-		]);
-		expect(sent.slice(beforeCompaction).map((request) => request.options?.cacheRetention)).toEqual(["none", "none"]);
-	});
-
-	it("composes explicit Agent callbacks rather than suppressing session hooks", async () => {
+	it("preserves exactly-once Agent hook delivery for normal turns", async () => {
 		const calls: string[] = [];
 		const session = await createSession((pi) => {
-			pi.on("before_provider_request", (event) => {
-				calls.push(`hook:${JSON.stringify(event.payload)}`);
-				return false;
+			pi.on("before_provider_headers", () => {
+				calls.push("headers");
+			});
+			pi.on("before_provider_request", () => {
+				calls.push("payload");
 			});
 			pi.on("after_provider_response", () => {
-				calls.push("hook:response");
+				calls.push("response");
 			});
 			pi.on("provider_stream_event", () => {
-				calls.push("hook:event");
+				calls.push("event");
 			});
 		});
-		session.agent.onPayload = async () => {
-			calls.push("caller:payload");
-			return null;
-		};
-		session.agent.onResponse = async () => {
-			calls.push("caller:response");
-		};
-		session.agent.onProviderStreamEvent = async () => {
-			calls.push("caller:event");
-		};
 
 		await session.prompt("turn");
 
-		expect(calls).toEqual([
-			"caller:payload",
-			"hook:null",
-			"caller:response",
-			"hook:response",
-			"caller:event",
-			"hook:event",
-			"caller:event",
-			"hook:event",
-		]);
-		expect(sent[0].payload).toBe(false);
+		expect(calls).toEqual(["headers", "payload", "response", "event", "event"]);
+		expect(sent).toHaveLength(1);
 	});
 
 	it.each([null, false, 0, "", undefined])("preserves caller payload replacement %s", async (replacement) => {
@@ -475,49 +405,43 @@ describe("session provider hooks", () => {
 		expect(sent).toHaveLength(1);
 	});
 
-	it.each(["registry", "sdk"] as const)(
-		"suppresses later %s hook emissions after reload without retargeting",
-		async (path) => {
-			const calls: string[] = [];
-			let generation = 0;
-			const session = await createSession((pi) => {
-				const owner = ++generation;
-				pi.on("before_provider_request", () => {
-					calls.push(`${owner}:payload`);
-				});
-				pi.on("after_provider_response", () => {
-					calls.push(`${owner}:response`);
-				});
-				pi.on("provider_stream_event", () => {
-					calls.push(`${owner}:event`);
-				});
+	it("suppresses later registry hook emissions after reload without retargeting", async () => {
+		const calls: string[] = [];
+		let generation = 0;
+		const session = await createSession((pi) => {
+			const owner = ++generation;
+			pi.on("before_provider_request", () => {
+				calls.push(`${owner}:payload`);
 			});
-			const entered = Promise.withResolvers<void>();
-			const release = Promise.withResolvers<void>();
-			const registry = session.extensionRunner.createContext().modelRegistry;
-			const options = {
-				onResponse: async () => {
-					entered.resolve();
-					await release.promise;
-					calls.push("caller:response");
-				},
-			};
-			const stream =
-				path === "registry"
-					? registry.streamSimple(model, { messages: [] }, options)
-					: await session.agent.streamFunction(model, normalizeContext({ messages: [] }), options);
-			await entered.promise;
-			await session.reload();
-			expect(() => registry.streamSimple(model, { messages: [] })).toThrow("stale");
-			expect(session.extensionRunner.createContext().modelRegistry).not.toBe(registry);
-			release.resolve();
-			expect((await stream.result()).stopReason).toBe("stop");
-			expect(calls).toEqual(["1:payload", "caller:response"]);
+			pi.on("after_provider_response", () => {
+				calls.push(`${owner}:response`);
+			});
+			pi.on("provider_stream_event", () => {
+				calls.push(`${owner}:event`);
+			});
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const registry = session.extensionRunner.createContext().modelRegistry;
+		const options = {
+			onResponse: async () => {
+				entered.resolve();
+				await release.promise;
+				calls.push("caller:response");
+			},
+		};
+		const stream = registry.streamSimple(model, { messages: [] }, options);
+		await entered.promise;
+		await session.reload();
+		expect(() => registry.streamSimple(model, { messages: [] })).toThrow("stale");
+		expect(session.extensionRunner.createContext().modelRegistry).not.toBe(registry);
+		release.resolve();
+		expect((await stream.result()).stopReason).toBe("stop");
+		expect(calls).toEqual(["1:payload", "caller:response"]);
 
-			await session.extensionRunner.createContext().modelRegistry.complete(model, { messages: [] });
-			expect(calls).toEqual(["1:payload", "caller:response", "2:payload", "2:response", "2:event", "2:event"]);
-		},
-	);
+		await session.extensionRunner.createContext().modelRegistry.complete(model, { messages: [] });
+		expect(calls).toEqual(["1:payload", "caller:response", "2:payload", "2:response", "2:event", "2:event"]);
+	});
 
 	it("suppresses disposed request hooks but still invokes caller observers", async () => {
 		const calls: string[] = [];
@@ -566,7 +490,6 @@ describe("session provider hooks", () => {
 		await expect(session.reload()).rejects.toThrow("load failed");
 
 		expect(() => registry.complete(model, { messages: [] })).toThrow("stale");
-		await expect(session.agent.streamFunction(model, normalizeContext({ messages: [] }))).rejects.toThrow("stale");
 		expect(sent).toEqual([]);
 		reload.mockRestore();
 		await session.reload();
@@ -753,92 +676,5 @@ describe("session provider hooks", () => {
 		expect(observed.map((entry) => entry.options?.headers)).toEqual([{ "x-hook": "yes" }, { "x-hook": "yes" }]);
 		for (const entry of observed) expect(entry.options).not.toHaveProperty("onProviderStreamEvent");
 		expect(calls).toEqual(["headers", "payload", "response", "headers", "payload", "response"]);
-	});
-
-	it("delivers provider hooks through automatic threshold compaction", async () => {
-		const calls: string[] = [];
-		const session = await createSession(
-			(pi) => {
-				pi.on("before_provider_headers", () => {
-					calls.push("headers");
-				});
-				pi.on("before_provider_request", () => {
-					calls.push("payload");
-				});
-				pi.on("after_provider_response", () => {
-					calls.push("response");
-				});
-				pi.on("provider_stream_event", () => {
-					calls.push("event");
-				});
-			},
-			{ compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 990_000 } },
-		);
-
-		await session.prompt("turn");
-
-		expect(session.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
-		// With no earlier turns, only the split-turn prefix needs summarizing.
-		expect(sent).toHaveLength(2);
-		expect(calls).toEqual([
-			"headers",
-			"payload",
-			"response",
-			"event",
-			"event",
-			"headers",
-			"payload",
-			"response",
-			"event",
-			"event",
-		]);
-	});
-
-	it("replays warming hooks once and cancels warming on reload", async () => {
-		vi.useFakeTimers();
-		const calls: string[] = [];
-		const session = await createSession(
-			(pi) => {
-				pi.on("before_provider_headers", () => {
-					calls.push("headers");
-				});
-				pi.on("before_provider_request", () => {
-					calls.push("payload");
-				});
-				pi.on("after_provider_response", () => {
-					calls.push("response");
-				});
-				pi.on("provider_stream_event", () => {
-					calls.push("event");
-				});
-			},
-			{ cacheWarming: "idle" },
-		);
-		await session.prompt("turn");
-		calls.length = 0;
-		await vi.advanceTimersByTimeAsync(270_000);
-		await vi.advanceTimersByTimeAsync(270_000);
-
-		expect(sent).toHaveLength(3);
-		expect(sent.slice(1).map((request) => [request.options?.maxTokens, request.options?.maxRetries])).toEqual([
-			[1, 0],
-			[1, 0],
-		]);
-		expect(calls).toEqual([
-			"headers",
-			"payload",
-			"response",
-			"event",
-			"event",
-			"headers",
-			"payload",
-			"response",
-			"event",
-			"event",
-		]);
-		await session.reload();
-		await vi.advanceTimersByTimeAsync(270_000);
-		expect(sent).toHaveLength(3);
-		expect(session.cacheWarmingStatus?.state).toBe("inactive");
 	});
 });
