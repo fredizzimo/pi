@@ -405,7 +405,7 @@ describe("session provider hooks", () => {
 		expect(sent).toHaveLength(1);
 	});
 
-	it("suppresses later registry hook emissions after reload without retargeting", async () => {
+	it("rejects stale registry callbacks after reload without retargeting", async () => {
 		const calls: string[] = [];
 		let generation = 0;
 		const session = await createSession((pi) => {
@@ -436,24 +436,35 @@ describe("session provider hooks", () => {
 		expect(() => registry.streamSimple(model, { messages: [] })).toThrow("stale");
 		expect(session.extensionRunner.createContext().modelRegistry).not.toBe(registry);
 		release.resolve();
-		expect((await stream.result()).stopReason).toBe("stop");
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("stale");
 		expect(calls).toEqual(["1:payload", "caller:response"]);
 
 		await session.extensionRunner.createContext().modelRegistry.complete(model, { messages: [] });
 		expect(calls).toEqual(["1:payload", "caller:response", "2:payload", "2:response", "2:event", "2:event"]);
 	});
 
-	it("suppresses disposed request hooks but still invokes caller observers", async () => {
+	// #9773: invalidation during caller callbacks must fail before session dispatch.
+	it.each([
+		["transformHeaders", []],
+		["onPayload", ["headers"]],
+		["onResponse", ["headers", "payload"]],
+		["onProviderStreamEvent", ["headers", "payload", "response"]],
+	] as const)("rejects disposed %s after awaiting its caller callback", async (callback, expectedHooks) => {
 		const calls: string[] = [];
 		const session = await createSession((pi) => {
+			pi.on("before_provider_headers", () => {
+				calls.push("headers");
+			});
 			pi.on("before_provider_request", () => {
-				calls.push("hook:payload");
+				calls.push("payload");
 			});
 			pi.on("after_provider_response", () => {
-				calls.push("hook:response");
+				calls.push("response");
 			});
 			pi.on("provider_stream_event", () => {
-				calls.push("hook:event");
+				calls.push("event");
 			});
 		});
 		const entered = Promise.withResolvers<void>();
@@ -463,13 +474,11 @@ describe("session provider hooks", () => {
 			model,
 			{ messages: [] },
 			{
-				onResponse: async () => {
+				[callback]: async (value: unknown) => {
 					entered.resolve();
 					await release.promise;
-					calls.push("caller:response");
-				},
-				onProviderStreamEvent: async () => {
-					calls.push("caller:event");
+					calls.push("caller:finished");
+					return value;
 				},
 			},
 		);
@@ -477,9 +486,82 @@ describe("session provider hooks", () => {
 		session.dispose();
 		release.resolve();
 
-		expect((await response).stopReason).toBe("stop");
-		expect(calls).toEqual(["hook:payload", "caller:response", "caller:event", "caller:event"]);
+		const result = await response;
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("stale");
+		expect(calls).toEqual([...expectedHooks, "caller:finished"]);
 		expect(() => registry.complete(model, { messages: [] })).toThrow("stale");
+	});
+
+	// #9773: the activity precondition also applies when no session handler exists.
+	it.each(["transformHeaders", "onPayload", "onResponse", "onProviderStreamEvent"] as const)(
+		"rejects stale %s even without registered handlers",
+		async (callback) => {
+			const session = await createSession(() => {});
+			const registry = session.extensionRunner.createContext().modelRegistry;
+
+			const result = await registry.complete(
+				model,
+				{ messages: [] },
+				{
+					[callback]: async (value: unknown) => {
+						session.dispose();
+						return value;
+					},
+				},
+			);
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("stale");
+		},
+	);
+
+	// #9773: an entered session hook may finish; only the next callback checks activity.
+	it.each([
+		["before_provider_headers", "onPayload"],
+		["before_provider_request", "onResponse"],
+		["after_provider_response", "onProviderStreamEvent"],
+		["provider_stream_event", "onProviderStreamEvent"],
+	] as const)("allows %s to finish after invalidation", async (hook, nextCallback) => {
+		const calls: string[] = [];
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const session = await createSession((pi) => {
+			const handler = async () => {
+				calls.push("hook:entered");
+				entered.resolve();
+				await release.promise;
+				calls.push("hook:finished");
+			};
+			// Narrow the event name for ExtensionAPI.on's event-specific overloads.
+			if (hook === "before_provider_headers") pi.on(hook, handler);
+			else if (hook === "before_provider_request") pi.on(hook, handler);
+			else if (hook === "after_provider_response") pi.on(hook, handler);
+			else pi.on(hook, handler);
+		});
+		const registry = session.extensionRunner.createContext().modelRegistry;
+		const response = registry.complete(
+			model,
+			{ messages: [] },
+			{
+				[nextCallback]: async () => {
+					calls.push("caller:next");
+				},
+			},
+		);
+		await entered.promise;
+		session.dispose();
+		release.resolve();
+
+		const result = await response;
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("stale");
+		expect(calls).toEqual([
+			...(hook === "provider_stream_event" ? ["caller:next"] : []),
+			"hook:entered",
+			"hook:finished",
+			"caller:next",
+		]);
 	});
 
 	it("keeps captured registries revoked when reload fails", async () => {

@@ -213,7 +213,11 @@ Use `ctx.modelRegistry.streamSimple()` for provider-neutral nested model calls.
 
 The context's registry is bound to its extension runtime. Its `stream()`, `streamSimple()` and `complete()` calls receive the session's provider hooks; `classify()` and `generateImages()` receive header, payload and response hooks, but no parsed stream events. Delivery depends on the provider adapter invoking the corresponding callback. For registry execution, request-local callbacks run first and are awaited; session hooks see their transformed payloads and headers. A caller callback failure stops the operation before the corresponding session hook. Nested registry calls made inside a provider hook also invoke hooks, so guard against unconditional recursion. Direct `session.modelRuntime` calls and independently constructed registries do not inherit this binding.
 
+<<<<<<< HEAD
 A captured registry cannot start new execution after reload or session disposal. Requests still preparing headers fail if their binding becomes stale; already-dispatched requests stop emitting session hooks, without switching to the replacement runtime's handlers. Caller callbacks remain active and detached provider work is not automatically cancelled.
+=======
+A captured registry cannot start new execution after reload or session disposal. Each registry-bound provider callback checks that its runner is active once at entry, after awaiting the corresponding caller callback and before checking for registered handlers. A stale callback throws; provider adapters may convert that exception into an error result. A session hook that has already entered may finish without another activity check. Callbacks never switch to the replacement runtime's handlers. Caller callbacks still run before this check, but a stale exception can prevent later callbacks. Detached provider work is not automatically cancelled.
+>>>>>>> 0a9d4c19e (fix(coding-agent): bind registry provider hooks)
 
 Command handlers receive `ExtensionCommandContext`, which adds operations for waiting until idle, reloading, tree navigation, and session replacement.
 These operations are command-only because calling them from lifecycle handlers can deadlock the runtime.
