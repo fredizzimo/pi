@@ -12,8 +12,9 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { estimateTokens } from "../../src/core/compaction/index.ts";
-import { createHarness, getUserTexts, type Harness } from "./harness.ts";
+import { estimateTokens, serializeConversation } from "../../src/core/compaction/index.ts";
+import { convertToLlm } from "../../src/core/messages.ts";
+import { createHarness, getMessageText, getUserTexts, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
@@ -184,6 +185,79 @@ describe("AgentSession compaction characterization", () => {
 		expect(statsAfter.cost).toBe(statsBefore.cost + summaryUsage.cost.total);
 		expect(harness.session.messages[0]?.role).toBe("system");
 		expect(harness.session.messages[1]?.role).toBe("compactionSummary");
+	});
+
+	// Regression test for #9773: custom compaction registry requests receive session provider hooks.
+	it("persists a registry-streamed custom compaction summary with provider hook delivery", async () => {
+		const hookCalls: string[] = [];
+		let compactionSignal: AbortSignal | undefined;
+		let requestContext: TranscriptContext | undefined;
+		let requestOptions: SimpleStreamOptions | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_provider_headers", () => {
+						hookCalls.push("headers");
+					});
+					// Faux invokes response callbacks, but not payload or parsed-stream callbacks.
+					pi.on("after_provider_response", (event) => {
+						hookCalls.push(`response:${event.status}`);
+					});
+					pi.on("session_before_compact", async (event, ctx) => {
+						if (!ctx.model) throw new Error("No compaction model");
+						const { preparation, signal } = event;
+						compactionSignal = signal;
+						const conversation = serializeConversation(
+							convertToLlm([...preparation.messagesToSummarize, ...preparation.turnPrefixMessages]),
+						);
+						const response = await ctx.modelRegistry
+							.streamSimple(
+								ctx.model,
+								{
+									messages: [
+										{
+											role: "user",
+											content: `Summarize this conversation:\n${conversation}`,
+											timestamp: Date.now(),
+										},
+									],
+								},
+								{ signal },
+							)
+							.result();
+						return {
+							compaction: {
+								summary: getMessageText(response),
+								firstKeptEntryId: preparation.firstKeptEntryId,
+								tokensBefore: preparation.tokensBefore,
+								usage: response.usage,
+							},
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.setResponses([
+			(context, options) => {
+				requestContext = context;
+				requestOptions = options;
+				return fauxAssistantMessage("summary generated during custom compaction");
+			},
+		]);
+
+		const result = await harness.session.compact();
+
+		expect(result.summary).toBe("summary generated during custom compaction");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toEqual([
+			expect.objectContaining({ summary: "summary generated during custom compaction", fromHook: true }),
+		]);
+		expect(JSON.stringify(requestContext?.messages)).toContain("[User]: message to compact");
+		expect(compactionSignal).toBeDefined();
+		expect(requestOptions?.signal).toBe(compactionSignal);
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(hookCalls).toEqual(["headers", "response:200"]);
 	});
 
 	it("checkpoints the replayed system state and folds summarized and retained system patches into it", async () => {
