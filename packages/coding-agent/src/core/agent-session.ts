@@ -3661,6 +3661,7 @@ export class AgentSession {
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
 		oldRunner.invalidate();
+		this._cacheWarmer?.cancel();
 		const getDefaultTools = () =>
 			this._usesDefaultTools
 				? applyToolModifiers(

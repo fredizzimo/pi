@@ -4,11 +4,14 @@
 
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
+	type AnyModel,
 	getCurrentSystemMessage,
 	type ImageContent,
 	type Model,
+	type ModelsRequestTransforms,
 	type Provider,
 	type ProviderHeaders,
+	type ProviderRequestOptions,
 } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
@@ -17,6 +20,7 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
+import { bindModelRegistry, composeProviderHooks, type ProviderHooks } from "../provider-hooks.ts";
 import type { SessionManager } from "../session-manager.ts";
 import {
 	type BuildSystemPromptOptions,
@@ -389,6 +393,34 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	private readonly providerHooks: ProviderHooks = {
+		transformHeaders: async (headers) => {
+			this.assertActive();
+			const transformed = this.hasHandlers("before_provider_headers")
+				? await this.emitBeforeProviderHeaders(headers)
+				: headers;
+			this.assertActive();
+			return transformed;
+		},
+		onPayload: async (payload) => {
+			if (this.staleMessage || !this.hasHandlers("before_provider_request")) return payload;
+			return this.emitBeforeProviderRequest(payload);
+		},
+		onResponse: async (response) => {
+			if (this.staleMessage || !this.hasHandlers("after_provider_response")) return;
+			await this.emit({ type: "after_provider_response", status: response.status, headers: response.headers });
+		},
+		onProviderStreamEvent: async (data, model) => {
+			if (this.staleMessage || !this.hasHandlers("provider_stream_event")) return;
+			await this.emit({
+				type: "provider_stream_event",
+				data,
+				provider: model.provider,
+				api: model.api,
+				model: model.id,
+			});
+		},
+	};
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
 
@@ -404,7 +436,18 @@ export class ExtensionRunner {
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
-		this.modelRegistry = modelRegistry;
+		this.modelRegistry = bindModelRegistry(modelRegistry, (model, options) =>
+			this.prepareProviderOptions(model, options),
+		);
+	}
+
+	/** Compose request-local callbacks with this runner's existing provider dispatch. */
+	prepareProviderOptions<
+		TModel extends AnyModel,
+		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
+	>(model: TModel, options?: TOptions): TOptions {
+		this.assertActive();
+		return composeProviderHooks(model, options, this.providerHooks);
 	}
 
 	bindCore(

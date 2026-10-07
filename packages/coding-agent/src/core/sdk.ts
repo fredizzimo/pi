@@ -344,8 +344,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const providerRetrySettings = settingsManager.getProviderRetrySettings();
 		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 		const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
-		const headerRunner = extensionRunnerRef.current;
-		return {
+		const runner = extensionRunnerRef.current;
+		const requestOptions: ModelsSimpleStreamOptions = {
 			...options,
 			timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
 			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
@@ -358,11 +358,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					options.sessionId,
 					requestHeaders,
 				);
-				return headerRunner?.hasHandlers("before_provider_headers")
-					? headerRunner.emitBeforeProviderHeaders(headers ?? {})
-					: (headers ?? {});
+				return headers ?? {};
 			},
 		};
+		// Agent forwards these SDK defaults, while summaries omit them. Replace only
+		// our own bridges; distinct caller callbacks compose before the runner hooks.
+		if (requestOptions.onPayload === transformProviderPayload) delete requestOptions.onPayload;
+		if (requestOptions.onResponse === handleProviderResponse) delete requestOptions.onResponse;
+		if (requestOptions.onProviderStreamEvent === handleProviderStreamEvent)
+			delete requestOptions.onProviderStreamEvent;
+		return runner ? runner.prepareProviderOptions(requestModel, requestOptions) : requestOptions;
 	};
 	// Warm only requests for the selected model. Requests a virtual selection routed, or that an
 	// extension redirected, may not be repeated by the next request, so warming them could be wasted.

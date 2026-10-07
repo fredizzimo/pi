@@ -211,6 +211,10 @@ The built-in MCP support connects registered servers. When nothing does, because
 `ExtensionContext` provides the working directory, mode, UI, session manager, model runtime, abort signal, context usage, and controls for compaction and shutdown.
 Use `ctx.modelRegistry.streamSimple()` for provider-neutral nested model calls.
 
+The context's registry is bound to its extension runtime. Its `stream()`, `streamSimple()` and `complete()` calls receive the session's provider hooks; `classify()` and `generateImages()` receive header, payload and response hooks, but no parsed stream events. Delivery depends on the provider adapter invoking the corresponding callback. For registry execution, request-local callbacks run first and are awaited; session hooks see their transformed payloads and headers. A caller callback failure stops the operation before the corresponding session hook. Nested registry calls made inside a provider hook also invoke hooks, so guard against unconditional recursion. Direct `session.modelRuntime` calls and independently constructed registries do not inherit this binding.
+
+A captured registry cannot start new execution after reload or session disposal. Requests still preparing headers fail if their binding becomes stale; already-dispatched requests stop emitting session hooks, without switching to the replacement runtime's handlers. Caller callbacks remain active and detached provider work is not automatically cancelled. Reload cancels cache warming; it restarts with the next eligible session request.
+
 Command handlers receive `ExtensionCommandContext`, which adds operations for waiting until idle, reloading, tree navigation, and session replacement.
 These operations are command-only because calling them from lifecycle handlers can deadlock the runtime.
 
