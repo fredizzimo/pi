@@ -51,11 +51,17 @@ export function composeProviderHooks<
 /** Wrap execution only; all other methods remain bound to the original facade. */
 export function bindModelRegistry(
 	registry: ModelRegistry,
-	prepareOptions: <TModel extends AnyModel, TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms>(
-		model: TModel,
-		options: TOptions | undefined,
-	) => TOptions,
+	hooks: ProviderHooks,
+	assertActive: () => void,
 ): ModelRegistry {
+	function prepareOptions<
+		TModel extends AnyModel,
+		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
+	>(model: TModel, options: TOptions | undefined): TOptions {
+		assertActive();
+		return composeProviderHooks(model, options, hooks);
+	}
+
 	const execution: Pick<ModelRegistry, "stream" | "streamSimple" | "complete" | "classify" | "generateImages"> = {
 		stream: <TApi extends Api>(
 			model: Model<TApi>,

@@ -17,7 +17,7 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
-import { bindModelRegistry, composeProviderHooks, type ProviderHooks } from "../provider-hooks.ts";
+import { bindModelRegistry, type ProviderHooks } from "../provider-hooks.ts";
 import type { SessionManager } from "../session-manager.ts";
 import {
 	type BuildSystemPromptOptions,
@@ -432,10 +432,7 @@ export class ExtensionRunner {
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
-		this.modelRegistry = bindModelRegistry(modelRegistry, (model, options) => {
-			this.assertActive();
-			return composeProviderHooks(model, options, this.providerHooks);
-		});
+		this.modelRegistry = bindModelRegistry(modelRegistry, this.providerHooks, this.assertActive.bind(this));
 	}
 
 	bindCore(
