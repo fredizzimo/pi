@@ -1,50 +1,28 @@
 import type { Api, Model, ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { AuthStorage } from "../src/core/auth-storage.ts";
-import { createEventBus } from "../src/core/event-bus.ts";
-import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
-import { ExtensionRunner } from "../src/core/extensions/runner.ts";
-import type { ExtensionFactory } from "../src/core/extensions/types.ts";
+import type { ExtensionAPI } from "../src/core/extensions/types.ts";
 import { composeProviderHooks } from "../src/core/provider-hooks.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
-import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
-
-const model: Model<Api> = {
-	id: "hook-model",
-	name: "Hook Model",
-	api: "hook-api",
-	provider: "hook-provider",
-	baseUrl: "https://hooks.invalid",
-	reasoning: false,
-	input: ["text"],
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	contextWindow: 1000,
-	maxTokens: 100,
-};
-
-async function createRunner(factory: ExtensionFactory): Promise<ExtensionRunner> {
-	const cwd = process.cwd();
-	const runtime = createExtensionRuntime();
-	const extension = await loadExtensionFromFactory(factory, cwd, createEventBus(), runtime);
-	const registry = await createInMemoryModelRegistry(AuthStorage.inMemory());
-	return new ExtensionRunner([extension], runtime, cwd, SessionManager.inMemory(cwd), registry);
-}
+import { createRunner, model } from "./provider-hook-test-utils.ts";
 
 const callbackCases = [
 	{
 		callback: "transformHeaders",
+		register: (pi: ExtensionAPI, handler: () => Promise<void>) => pi.on("before_provider_headers", handler),
 		invoke: (options: ModelsSimpleStreamOptions) => options.transformHeaders!({}),
 	},
 	{
 		callback: "onPayload",
+		register: (pi: ExtensionAPI, handler: () => Promise<void>) => pi.on("before_provider_request", handler),
 		invoke: (options: ModelsSimpleStreamOptions) => options.onPayload!({}, model),
 	},
 	{
 		callback: "onResponse",
+		register: (pi: ExtensionAPI, handler: () => Promise<void>) => pi.on("after_provider_response", handler),
 		invoke: (options: ModelsSimpleStreamOptions) => options.onResponse!({ status: 200, headers: {} }, model),
 	},
 	{
 		callback: "onProviderStreamEvent",
+		register: (pi: ExtensionAPI, handler: () => Promise<void>) => pi.on("provider_stream_event", handler),
 		invoke: (options: ModelsSimpleStreamOptions) => options.onProviderStreamEvent!({ index: 1 }, model),
 	},
 ];
@@ -124,7 +102,7 @@ describe("provider hook composition", () => {
 		expect(result).toEqual({ hook: true });
 	});
 
-	it.each(callbackCases)("awaits the caller before $callback hook delivery", async ({ invoke }) => {
+	it.each(callbackCases)("awaits the caller before $callback hook delivery", async ({ invoke, register }) => {
 		const calls: string[] = [];
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -135,13 +113,9 @@ describe("provider hook composition", () => {
 			calls.push("caller:finished");
 		};
 		const runner = await createRunner((pi) => {
-			const handler = () => {
+			register(pi, async () => {
 				calls.push("hook");
-			};
-			pi.on("before_provider_headers", handler);
-			pi.on("before_provider_request", handler);
-			pi.on("after_provider_response", handler);
-			pi.on("provider_stream_event", handler);
+			});
 		});
 		const composed = composeProviderHooks<Model<Api>, ModelsSimpleStreamOptions>(
 			model,
@@ -169,20 +143,16 @@ describe("provider hook composition", () => {
 		expect(calls).toEqual(["caller:entered", "caller:finished", "hook"]);
 	});
 
-	it.each(callbackCases)("propagates caller failure before $callback hook delivery", async ({ invoke }) => {
+	it.each(callbackCases)("propagates caller failure before $callback hook delivery", async ({ invoke, register }) => {
 		const calls: string[] = [];
 		const failure = new Error("caller failed");
 		const caller = async () => {
 			throw failure;
 		};
 		const runner = await createRunner((pi) => {
-			const handler = () => {
+			register(pi, async () => {
 				calls.push("hook");
-			};
-			pi.on("before_provider_headers", handler);
-			pi.on("before_provider_request", handler);
-			pi.on("after_provider_response", handler);
-			pi.on("provider_stream_event", handler);
+			});
 		});
 		const composed = composeProviderHooks<Model<Api>, ModelsSimpleStreamOptions>(
 			model,
@@ -193,5 +163,101 @@ describe("provider hook composition", () => {
 		await expect(invoke(composed)).rejects.toBe(failure);
 
 		expect(calls).toEqual([]);
+	});
+
+	// #9773: callback lifetime is local to the captured runner, independent of provider sequencing.
+	it.each(callbackCases)(
+		"rejects $callback invalidated while its caller awaits",
+		async ({ callback, invoke, register }) => {
+			const calls: string[] = [];
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const runner = await createRunner((pi) => {
+				register(pi, async () => {
+					calls.push("hook");
+				});
+			});
+			const composed = composeProviderHooks<Model<Api>, ModelsSimpleStreamOptions>(
+				model,
+				{
+					[callback]: async (value: unknown) => {
+						entered.resolve();
+						await release.promise;
+						calls.push("caller:finished");
+						return value;
+					},
+				},
+				runner,
+			);
+
+			const pending = invoke(composed);
+			await entered.promise;
+			runner.invalidate();
+			release.resolve();
+
+			await expect(pending).rejects.toThrow("stale");
+			expect(calls).toEqual(["caller:finished"]);
+		},
+	);
+
+	it.each(callbackCases)("rejects stale $callback even without handlers", async ({ callback, invoke }) => {
+		const runner = await createRunner(() => {});
+		const composed = composeProviderHooks<Model<Api>, ModelsSimpleStreamOptions>(
+			model,
+			{
+				[callback]: async (value: unknown) => {
+					runner.invalidate();
+					return value;
+				},
+			},
+			runner,
+		);
+
+		await expect(invoke(composed)).rejects.toThrow("stale");
+	});
+
+	it.each(callbackCases)(
+		"lets an entered $callback hook finish without a post-await guard",
+		async ({ invoke, register }) => {
+			const calls: string[] = [];
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const runner = await createRunner((pi) => {
+				register(pi, async () => {
+					calls.push("hook:entered");
+					entered.resolve();
+					await release.promise;
+					calls.push("hook:finished");
+				});
+			});
+			const composed = composeProviderHooks<Model<Api>, ModelsSimpleStreamOptions>(model, {}, runner);
+
+			const pending = invoke(composed);
+			await entered.promise;
+			runner.invalidate();
+			release.resolve();
+
+			await pending;
+			expect(calls).toEqual(["hook:entered", "hook:finished"]);
+			await expect(invoke(composed)).rejects.toThrow("stale");
+			expect(calls).toEqual(["hook:entered", "hook:finished"]);
+		},
+	);
+
+	it("retains runner error reporting and payload chaining", async () => {
+		const runner = await createRunner((pi) => {
+			pi.on("before_provider_request", (event) => {
+				(event.payload as Record<string, unknown>).mutated = true;
+				throw new Error("extension failed");
+			});
+			pi.on("before_provider_request", (event) => ({ final: event.payload }));
+		});
+		const errors: string[] = [];
+		runner.onError((error) => errors.push(error.error));
+
+		const result = await runner.emitBeforeProviderRequest({ original: true });
+
+		expect(result).toEqual({ final: { original: true, mutated: true } });
+		expect(errors).toEqual(["extension failed"]);
 	});
 });

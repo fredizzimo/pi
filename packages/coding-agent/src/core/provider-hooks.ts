@@ -62,7 +62,7 @@ export function composeProviderHooks<
 	} as TOptions;
 }
 
-/** Wrap execution only; all other methods remain bound to the original facade. */
+/** Override execution only; inherited facade methods use the original registry's runtime. */
 export function bindModelRegistry(registry: ModelRegistry, runner: ExtensionRunner): ModelRegistry {
 	const execution: Pick<ModelRegistry, "stream" | "streamSimple" | "complete" | "classify" | "generateImages"> = {
 		stream: <TApi extends Api>(
@@ -82,14 +82,5 @@ export function bindModelRegistry(registry: ModelRegistry, runner: ExtensionRunn
 		generateImages: (model, context, options) =>
 			registry.generateImages(model, context, composeProviderHooks(model, options, runner)),
 	};
-	const methods = new Map<PropertyKey, unknown>();
-	return new Proxy(registry, {
-		get(target, property) {
-			if (Object.hasOwn(execution, property)) return Reflect.get(execution, property);
-			const value: unknown = Reflect.get(target, property);
-			if (typeof value !== "function") return value;
-			if (!methods.has(property)) methods.set(property, value.bind(target));
-			return methods.get(property);
-		},
-	});
+	return Object.assign(Object.create(registry), execution);
 }

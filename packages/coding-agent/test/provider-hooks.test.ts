@@ -3,63 +3,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	type Api,
-	type AssistantMessage,
-	type ClassifierModel,
-	type ClassifierOptions,
 	createAssistantMessageEventStream,
-	type ImageModel,
-	type ImagesOptions,
 	type Model,
-	type ModelsSimpleStreamOptions,
-	normalizeContext,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import type { ExtensionAPI, ExtensionFactory } from "../src/core/extensions/types.ts";
+import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import type { ModelRuntime } from "../src/core/model-runtime.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
+import { message, model } from "./provider-hook-test-utils.ts";
 
-const model: Model<Api> = {
-	id: "hook-model",
-	name: "Hook Model",
-	api: "hook-api",
-	provider: "hook-provider",
-	baseUrl: "https://hooks.invalid",
-	reasoning: false,
-	input: ["text"],
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	contextWindow: 10_000,
-	maxTokens: 1000,
-};
-
-function message(): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [{ type: "text", text: "response" }],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: {
-			input: 1,
-			output: 1,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 2,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "stop",
-		timestamp: Date.now(),
-	};
-}
-
-// Regression coverage for #9773: exercise real SDK/runner/registry/runtime wiring.
-// Only the provider boundary is synthetic, so no endpoint or paid request is used.
+// #9773: SDK integration covers session ownership and lifecycle, not callback-local composition rules.
+// Only the provider boundary is synthetic; no endpoint or paid request is used.
 describe("session provider hooks", () => {
 	let tempDir: string;
 	const sessions: AgentSession[] = [];
@@ -91,7 +52,7 @@ describe("session provider hooks", () => {
 		};
 		runtime.registerProvider(model.provider, {
 			api: model.api,
-			models: [{ ...model }],
+			models: [model],
 			headers: { "x-provider": "yes" },
 			streamSimple: stream,
 		});
@@ -130,73 +91,7 @@ describe("session provider hooks", () => {
 		return session;
 	}
 
-	describe("registry and Agent wiring", () => {
-		it.each(["stream", "streamSimple", "complete"] as const)(
-			"composes all hooks once for registry %s",
-			async (method) => {
-				const calls: string[] = [];
-				const session = await createSession((pi) => {
-					pi.on("before_provider_headers", (event) => {
-						calls.push("hook:headers");
-						expect(event.headers).toEqual({ "x-caller": "yes" });
-						event.headers["x-hook"] = "yes";
-					});
-					pi.on("before_provider_request", (event) => {
-						calls.push("hook:payload");
-						expect(event.payload).toEqual({ caller: true });
-						return { hook: true };
-					});
-					pi.on("after_provider_response", () => {
-						calls.push("hook:response");
-					});
-					pi.on("provider_stream_event", (event) => {
-						calls.push(`hook:event:${(event.data as { index: number }).index}`);
-					});
-				});
-				const registry = session.extensionRunner.createContext().modelRegistry;
-				expect(registry).toBe(session.extensionRunner.createCommandContext().modelRegistry);
-				const options: ModelsSimpleStreamOptions = Object.freeze({
-					transformHeaders: async () => {
-						calls.push("caller:headers");
-						return { "x-caller": "yes" };
-					},
-					onPayload: async () => {
-						calls.push("caller:payload");
-						return { caller: true };
-					},
-					onResponse: async () => {
-						calls.push("caller:response");
-					},
-					onProviderStreamEvent: async (data: unknown) => {
-						calls.push(`caller:event:${(data as { index: number }).index}`);
-					},
-				});
-
-				const response =
-					method === "complete"
-						? await registry.complete(model, normalizeContext({ messages: [] }), options)
-						: await registry[method](model, normalizeContext({ messages: [] }), options).result();
-
-				expect(response.stopReason).toBe("stop");
-				expect(calls).toEqual([
-					"caller:headers",
-					"hook:headers",
-					"caller:payload",
-					"hook:payload",
-					"caller:response",
-					"hook:response",
-					"caller:event:1",
-					"hook:event:1",
-					"caller:event:2",
-					"hook:event:2",
-				]);
-				expect(sent).toHaveLength(1);
-				expect(sent[0].payload).toEqual({ hook: true });
-				expect(sent[0].options?.headers).toEqual({ "x-caller": "yes", "x-hook": "yes" });
-				expect(options).not.toHaveProperty("headers");
-			},
-		);
-
+	describe("Agent and session ownership", () => {
 		it("preserves exactly-once Agent hook delivery for normal turns", async () => {
 			const calls: string[] = [];
 			const session = await createSession((pi) => {
@@ -218,24 +113,6 @@ describe("session provider hooks", () => {
 
 			expect(calls).toEqual(["headers", "payload", "response", "event", "event"]);
 			expect(sent).toHaveLength(1);
-		});
-
-		it("retains runner error reporting and payload chaining", async () => {
-			const session = await createSession((pi) => {
-				pi.on("before_provider_request", (event) => {
-					(event.payload as Record<string, unknown>).mutated = true;
-					throw new Error("extension failed");
-				});
-				pi.on("before_provider_request", (event) => ({ final: event.payload }));
-			});
-			const errors: string[] = [];
-			session.extensionRunner.onError((error) => errors.push(error.error));
-
-			const result = await session.extensionRunner.createContext().modelRegistry.complete(model, { messages: [] });
-
-			expect(result.stopReason).toBe("stop");
-			expect(sent[0].payload).toEqual({ final: { original: true, mutated: true } });
-			expect(errors).toEqual(["extension failed"]);
 		});
 
 		it("isolates interleaved requests from sessions sharing a runtime without wire session ids", async () => {
@@ -335,7 +212,7 @@ describe("session provider hooks", () => {
 		});
 	});
 
-	describe("runner lifetime", () => {
+	describe("session lifetime", () => {
 		it("rejects stale registry callbacks after reload without retargeting", async () => {
 			const calls: string[] = [];
 			let generation = 0;
@@ -354,14 +231,17 @@ describe("session provider hooks", () => {
 			const entered = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
 			const registry = session.extensionRunner.createContext().modelRegistry;
-			const options = {
-				onResponse: async () => {
-					entered.resolve();
-					await release.promise;
-					calls.push("caller:response");
+			const stream = registry.streamSimple(
+				model,
+				{ messages: [] },
+				{
+					onResponse: async () => {
+						entered.resolve();
+						await release.promise;
+						calls.push("caller:response");
+					},
 				},
-			};
-			const stream = registry.streamSimple(model, { messages: [] }, options);
+			);
 			await entered.promise;
 			await session.reload();
 			expect(() => registry.streamSimple(model, { messages: [] })).toThrow("stale");
@@ -376,32 +256,11 @@ describe("session provider hooks", () => {
 			expect(calls).toEqual(["1:payload", "caller:response", "2:payload", "2:response", "2:event", "2:event"]);
 		});
 
-		// #9773: dispose during each caller callback, before its matching session hook enters.
-		it.each([
-			{
-				callback: "transformHeaders",
-				register: (pi: ExtensionAPI, handler: () => void) => pi.on("before_provider_headers", handler),
-				sentCount: 0,
-			},
-			{
-				callback: "onPayload",
-				register: (pi: ExtensionAPI, handler: () => void) => pi.on("before_provider_request", handler),
-				sentCount: 0,
-			},
-			{
-				callback: "onResponse",
-				register: (pi: ExtensionAPI, handler: () => void) => pi.on("after_provider_response", handler),
-				sentCount: 1,
-			},
-			{
-				callback: "onProviderStreamEvent",
-				register: (pi: ExtensionAPI, handler: () => void) => pi.on("provider_stream_event", handler),
-				sentCount: 1,
-			},
-		])("rejects disposed $callback after awaiting its caller callback", async ({ callback, register, sentCount }) => {
+		// #9773: retain one real-session disposal race; the four-callback contract is tested locally.
+		it("revokes captured registry admission and pending callbacks on disposal", async () => {
 			const calls: string[] = [];
 			const session = await createSession((pi) => {
-				register(pi, () => {
+				pi.on("before_provider_headers", () => {
 					calls.push("hook");
 				});
 			});
@@ -412,11 +271,11 @@ describe("session provider hooks", () => {
 				model,
 				{ messages: [] },
 				{
-					[callback]: async (value: unknown) => {
+					transformHeaders: async (headers) => {
 						entered.resolve();
 						await release.promise;
 						calls.push("caller:finished");
-						return value;
+						return headers;
 					},
 				},
 			);
@@ -428,146 +287,9 @@ describe("session provider hooks", () => {
 			expect(result.stopReason).toBe("error");
 			expect(result.errorMessage).toContain("stale");
 			expect(calls).toEqual(["caller:finished"]);
-			expect(sent).toHaveLength(sentCount);
+			expect(sent).toEqual([]);
 			expect(() => registry.complete(model, { messages: [] })).toThrow("stale");
 			expect(() => registry.stream(model, { messages: [] })).toThrow("stale");
-		});
-
-		// #9773: the activity precondition also applies when no session handler exists.
-		it.each([
-			{ callback: "transformHeaders", nextCallback: "onPayload", sentCount: 0 },
-			{ callback: "onPayload", nextCallback: "onResponse", sentCount: 0 },
-			{ callback: "onResponse", nextCallback: "onProviderStreamEvent", sentCount: 1 },
-		])(
-			"rejects stale $callback before $nextCallback even without registered handlers",
-			async ({ callback, nextCallback, sentCount }) => {
-				const session = await createSession(() => {});
-				const registry = session.extensionRunner.createContext().modelRegistry;
-				const calls: string[] = [];
-
-				const result = await registry.complete(
-					model,
-					{ messages: [] },
-					{
-						[callback]: async (value: unknown) => {
-							calls.push("caller:dispose");
-							session.dispose();
-							return value;
-						},
-						[nextCallback]: async () => {
-							calls.push("caller:next");
-						},
-					},
-				);
-
-				expect(result.stopReason).toBe("error");
-				expect(result.errorMessage).toContain("stale");
-				expect(calls).toEqual(["caller:dispose"]);
-				expect(sent).toHaveLength(sentCount);
-			},
-		);
-
-		// #9773: stream events repeat the same callback; no second caller entry may occur.
-		it("rejects the first stale stream event even without registered handlers", async () => {
-			const session = await createSession(() => {});
-			const registry = session.extensionRunner.createContext().modelRegistry;
-			const events: unknown[] = [];
-
-			const result = await registry.complete(
-				model,
-				{ messages: [] },
-				{
-					onProviderStreamEvent: async (data) => {
-						events.push(data);
-						session.dispose();
-					},
-				},
-			);
-
-			expect(result.stopReason).toBe("error");
-			expect(result.errorMessage).toContain("stale");
-			expect(events).toEqual([{ index: 1 }]);
-		});
-
-		// #9773: an entered hook may finish; activity is checked on the next callback's entry.
-		it.each([
-			{
-				hook: "before_provider_headers",
-				register: (pi: ExtensionAPI, handler: () => Promise<void>) => pi.on("before_provider_headers", handler),
-				nextCallback: "onPayload",
-			},
-			{
-				hook: "before_provider_request",
-				register: (pi: ExtensionAPI, handler: () => Promise<void>) => pi.on("before_provider_request", handler),
-				nextCallback: "onResponse",
-			},
-			{
-				hook: "after_provider_response",
-				register: (pi: ExtensionAPI, handler: () => Promise<void>) => pi.on("after_provider_response", handler),
-				nextCallback: "onProviderStreamEvent",
-			},
-		])("allows entered $hook to finish before stale $nextCallback fails", async ({ register, nextCallback }) => {
-			const calls: string[] = [];
-			const entered = Promise.withResolvers<void>();
-			const release = Promise.withResolvers<void>();
-			const session = await createSession((pi) => {
-				register(pi, async () => {
-					calls.push("hook:entered");
-					entered.resolve();
-					await release.promise;
-					calls.push("hook:finished");
-				});
-			});
-			const registry = session.extensionRunner.createContext().modelRegistry;
-			const response = registry.complete(
-				model,
-				{ messages: [] },
-				{
-					[nextCallback]: async () => {
-						calls.push("caller:next");
-					},
-				},
-			);
-			await entered.promise;
-			session.dispose();
-			release.resolve();
-
-			const result = await response;
-			expect(result.stopReason).toBe("error");
-			expect(result.errorMessage).toContain("stale");
-			expect(calls).toEqual(["hook:entered", "hook:finished", "caller:next"]);
-		});
-
-		// #9773: repeated stream events re-enter the same callback rather than advancing to another hook.
-		it("finishes an entered stream hook but rejects the next stream event after disposal", async () => {
-			const calls: string[] = [];
-			const entered = Promise.withResolvers<void>();
-			const release = Promise.withResolvers<void>();
-			const session = await createSession((pi) => {
-				pi.on("provider_stream_event", async (event) => {
-					calls.push(`hook:entered:${(event.data as { index: number }).index}`);
-					entered.resolve();
-					await release.promise;
-					calls.push("hook:finished");
-				});
-			});
-			const pending = session.extensionRunner.createContext().modelRegistry.complete(
-				model,
-				{ messages: [] },
-				{
-					onProviderStreamEvent: async (data) => {
-						calls.push(`caller:event:${(data as { index: number }).index}`);
-					},
-				},
-			);
-			await entered.promise;
-			session.dispose();
-			release.resolve();
-
-			const result = await pending;
-			expect(result.stopReason).toBe("error");
-			expect(result.errorMessage).toContain("stale");
-			expect(calls).toEqual(["caller:event:1", "hook:entered:1", "hook:finished", "caller:event:2"]);
 		});
 
 		it("keeps captured registries revoked when reload fails", async () => {
@@ -597,8 +319,7 @@ describe("session provider hooks", () => {
 				await release.promise;
 				return typeof request === "string" ? getAuth(request, overrides) : getAuth(request, overrides);
 			});
-			const registry = session.extensionRunner.createContext().modelRegistry;
-			const result = registry.complete(model, { messages: [] });
+			const result = session.extensionRunner.createContext().modelRegistry.complete(model, { messages: [] });
 			await entered.promise;
 			session.dispose();
 			release.resolve();
@@ -606,192 +327,6 @@ describe("session provider hooks", () => {
 			expect((await result).errorMessage).toContain("stale");
 			expect(sent).toEqual([]);
 			auth.mockRestore();
-		});
-	});
-
-	describe("non-chat registry wiring", () => {
-		// #9773: each non-chat entry point installs only header/payload/response callbacks.
-		it("binds image execution without parsed-event callbacks", async () => {
-			const observed: Array<{ payload: unknown; options?: ImagesOptions }> = [];
-			const calls: string[] = [];
-			const image: ImageModel<string> = {
-				type: "image",
-				id: "image",
-				name: "image",
-				api: "hook-images",
-				provider: "operations",
-				baseUrl: model.baseUrl,
-				input: ["text"],
-				output: ["image"],
-				cost: model.cost,
-			};
-			runtime.registerProvider("operations", {
-				apiKey: "operations-key",
-				models: [image],
-				images: {
-					"hook-images": {
-						generateImages: async (requestModel, _context, options) => {
-							observed.push({
-								payload: await options?.onPayload?.({ operation: "image" }, requestModel),
-								options,
-							});
-							await options?.onResponse?.({ status: 201, headers: {} }, requestModel);
-							return {
-								api: requestModel.api,
-								provider: requestModel.provider,
-								model: requestModel.id,
-								output: [],
-								stopReason: "stop",
-								timestamp: 0,
-							};
-						},
-					},
-				},
-			});
-			const session = await createSession((pi) => {
-				pi.on("before_provider_headers", (event) => {
-					calls.push("hook:headers");
-					event.headers["x-hook"] = "yes";
-				});
-				pi.on("before_provider_request", (event) => {
-					calls.push("hook:payload");
-					return { wrapped: event.payload };
-				});
-				pi.on("after_provider_response", () => {
-					calls.push("hook:response");
-				});
-				pi.on("provider_stream_event", () => {
-					calls.push("hook:event");
-				});
-			});
-			const callerModels: ImageModel<string>[] = [];
-
-			const result = await session.extensionRunner.createContext().modelRegistry.generateImages(
-				image,
-				{ input: [{ type: "text", text: "circle" }] },
-				{
-					transformHeaders: async () => {
-						calls.push("caller:headers");
-						return { "x-caller": "yes" };
-					},
-					onPayload: async (payload, requestModel) => {
-						calls.push("caller:payload");
-						callerModels.push(requestModel);
-						return { caller: payload };
-					},
-					onResponse: async (_response, requestModel) => {
-						calls.push("caller:response");
-						callerModels.push(requestModel);
-					},
-				},
-			);
-
-			expect(result.stopReason).toBe("stop");
-			expect(callerModels).toEqual([image, image]);
-			expect(observed).toHaveLength(1);
-			expect(observed[0].payload).toEqual({ wrapped: { caller: { operation: "image" } } });
-			expect(observed[0].options?.headers).toEqual({ "x-caller": "yes", "x-hook": "yes" });
-			expect(observed[0].options).not.toHaveProperty("onProviderStreamEvent");
-			expect(calls).toEqual([
-				"caller:headers",
-				"hook:headers",
-				"caller:payload",
-				"hook:payload",
-				"caller:response",
-				"hook:response",
-			]);
-		});
-
-		// #9773: classifier callback/model forwarding is independent of image dispatch.
-		it("binds classifier execution without parsed-event callbacks", async () => {
-			const observed: Array<{ payload: unknown; options?: ClassifierOptions }> = [];
-			const calls: string[] = [];
-			const classifier: ClassifierModel<string> = {
-				type: "classifier",
-				id: "classifier",
-				name: "classifier",
-				api: "hook-classifier",
-				provider: "operations",
-				baseUrl: model.baseUrl,
-				input: ["text"],
-				cost: model.cost,
-				contextWindow: 1000,
-			};
-			runtime.registerProvider("operations", {
-				apiKey: "operations-key",
-				models: [classifier],
-				classifiers: {
-					"hook-classifier": {
-						classify: async (requestModel, _context, options) => {
-							observed.push({
-								payload: await options?.onPayload?.({ operation: "classifier" }, requestModel),
-								options,
-							});
-							await options?.onResponse?.({ status: 201, headers: {} }, requestModel);
-							return {
-								api: requestModel.api,
-								provider: requestModel.provider,
-								model: requestModel.id,
-								answers: {},
-								stopReason: "stop",
-								timestamp: 0,
-							};
-						},
-					},
-				},
-			});
-			const session = await createSession((pi) => {
-				pi.on("before_provider_headers", (event) => {
-					calls.push("hook:headers");
-					event.headers["x-hook"] = "yes";
-				});
-				pi.on("before_provider_request", (event) => {
-					calls.push("hook:payload");
-					return { wrapped: event.payload };
-				});
-				pi.on("after_provider_response", () => {
-					calls.push("hook:response");
-				});
-				pi.on("provider_stream_event", () => {
-					calls.push("hook:event");
-				});
-			});
-			const callerModels: ClassifierModel<string>[] = [];
-
-			const result = await session.extensionRunner.createContext().modelRegistry.classify(
-				classifier,
-				{ state: {}, questions: {} },
-				{
-					transformHeaders: async () => {
-						calls.push("caller:headers");
-						return { "x-caller": "yes" };
-					},
-					onPayload: async (payload, requestModel) => {
-						calls.push("caller:payload");
-						callerModels.push(requestModel);
-						return { caller: payload };
-					},
-					onResponse: async (_response, requestModel) => {
-						calls.push("caller:response");
-						callerModels.push(requestModel);
-					},
-				},
-			);
-
-			expect(result.stopReason).toBe("stop");
-			expect(callerModels).toEqual([classifier, classifier]);
-			expect(observed).toHaveLength(1);
-			expect(observed[0].payload).toEqual({ wrapped: { caller: { operation: "classifier" } } });
-			expect(observed[0].options?.headers).toEqual({ "x-caller": "yes", "x-hook": "yes" });
-			expect(observed[0].options).not.toHaveProperty("onProviderStreamEvent");
-			expect(calls).toEqual([
-				"caller:headers",
-				"hook:headers",
-				"caller:payload",
-				"hook:payload",
-				"caller:response",
-				"hook:response",
-			]);
 		});
 	});
 });
