@@ -1,19 +1,35 @@
 import {
-	type Api,
 	type ClassifierModel,
 	createAssistantMessageEventStream,
+	fauxAssistantMessage,
 	type ImageModel,
 	type Model,
 	type ModelsSimpleStreamOptions,
-	type SimpleStreamOptions,
+	type ProviderHeaders,
 } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import type { ExtensionAPI } from "../src/core/extensions/types.ts";
+import { createEventBus } from "../src/core/event-bus.ts";
+import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
+import { ExtensionRunner } from "../src/core/extensions/runner.ts";
+import type { ExtensionAPI, ExtensionFactory } from "../src/core/extensions/types.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
-import type { ModelRuntime } from "../src/core/model-runtime.ts";
-import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
-import { createRunner, message, model } from "./provider-hook-test-utils.ts";
+import { composeProviderHooks } from "../src/core/provider-hooks.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
+
+const model: Model<string> = {
+	id: "chat",
+	name: "Chat",
+	api: "hooks",
+	provider: "hooks",
+	baseUrl: "https://hooks.invalid",
+	reasoning: false,
+	input: ["text"],
+	contextWindow: 1000,
+	maxTokens: 100,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+};
 
 function recordHooks(pi: ExtensionAPI, calls: string[]) {
 	pi.on("before_provider_headers", () => {
@@ -30,97 +46,179 @@ function recordHooks(pi: ExtensionAPI, calls: string[]) {
 	});
 }
 
-// #9773: public registry wiring uses real runner/registry/runtime components, not SDK sessions.
-describe("bound registry execution", () => {
+// #9773: real runner/registry/runtime wiring; only the provider boundary is synthetic.
+describe("bound registry provider hooks", () => {
 	let registry: ModelRegistry;
-	let runtime: ModelRuntime;
+	let sent: Array<{ headers: ProviderHeaders | undefined; payload: unknown; maxTokens: number | undefined }>;
 
 	beforeEach(async () => {
 		registry = await createInMemoryModelRegistry(AuthStorage.inMemory());
-		runtime = getModelRuntime(registry);
-	});
-
-	it.each(["stream", "streamSimple", "complete"] as const)("installs chat hooks once for %s", async (method) => {
-		const calls: string[] = [];
-		const callerModels: Model<Api>[] = [];
-		const dispatched: Model<Api>[] = [];
-		runtime.registerProvider(model.provider, {
+		sent = [];
+		registry.registerProvider(model.provider, {
 			api: model.api,
-			apiKey: "hook-key",
+			apiKey: "test-key",
 			models: [model],
 			streamSimple: (requestModel, _context, options) => {
-				dispatched.push(requestModel);
-				const result = createAssistantMessageEventStream();
+				const stream = createAssistantMessageEventStream();
+				const message = {
+					...fauxAssistantMessage("ok"),
+					api: requestModel.api,
+					provider: requestModel.provider,
+					model: requestModel.id,
+				};
 				void (async () => {
 					try {
-						await options?.onPayload?.({}, requestModel);
-						await options?.onResponse?.({ status: 200, headers: {} }, requestModel);
-						await options?.onProviderStreamEvent?.({}, requestModel);
-						result.end(message(requestModel));
+						const payload = await options?.onPayload?.({ original: true }, requestModel);
+						sent.push({ headers: options?.headers, payload, maxTokens: options?.maxTokens });
+						await options?.onResponse?.({ status: 201, headers: { "x-response": "yes" } }, requestModel);
+						await options?.onProviderStreamEvent?.({ index: 1 }, requestModel);
+						stream.end(message);
 					} catch (error) {
-						result.end({ ...message(requestModel), stopReason: "error", errorMessage: String(error) });
+						stream.end({ ...message, stopReason: "error", errorMessage: String(error) });
 					}
 				})();
-				return result;
+				return stream;
 			},
 		});
-		const runner = await createRunner((pi) => recordHooks(pi, calls), registry);
-		const bound = runner.createContext().modelRegistry;
-		const options = Object.freeze<ModelsSimpleStreamOptions>({
-			transformHeaders: (headers) => {
-				calls.push("caller:headers");
-				return headers;
-			},
-			onPayload: (_payload, requestModel) => {
-				callerModels.push(requestModel);
-			},
-			onResponse: (_response, requestModel) => {
-				callerModels.push(requestModel);
-			},
-			onProviderStreamEvent: (_event, requestModel) => {
-				callerModels.push(requestModel);
-			},
-		});
-
-		const result =
-			method === "complete"
-				? await bound.complete(model, { messages: [] }, options)
-				: await bound[method](model, { messages: [] }, options).result();
-
-		expect(result.stopReason).toBe("stop");
-		expect(calls).toEqual(["caller:headers", "headers", "payload", "response", "event"]);
-		expect(callerModels).toEqual([model, model, model]);
-		expect(dispatched).toEqual([model]);
-		expect(options).not.toHaveProperty("headers");
-		expect(bound).toBe(runner.createCommandContext().modelRegistry);
-		runner.invalidate();
-		expect(() => bound[method](model, { messages: [] })).toThrow("stale");
 	});
 
-	it("installs image hooks and forwards the model without a stream callback", async () => {
+	async function createRunner(factory: ExtensionFactory) {
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(factory, process.cwd(), createEventBus(), runtime);
+		return new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), registry);
+	}
+
+	it("completes with caller-first transformations and response events", async () => {
 		const calls: string[] = [];
-		const callerModels: ImageModel<string>[] = [];
+		const observed: unknown[] = [];
+		const callerModels: Model<string>[] = [];
+		const runner = await createRunner((pi) => {
+			pi.on("before_provider_headers", (event) => {
+				calls.push("headers");
+				event.headers["x-hook"] = "yes";
+			});
+			pi.on("before_provider_request", (event) => {
+				calls.push("payload");
+				observed.push(event.payload);
+				return { hook: true };
+			});
+			pi.on("after_provider_response", (event) => {
+				calls.push("response");
+				observed.push(event);
+			});
+			pi.on("provider_stream_event", (event) => {
+				calls.push("event");
+				observed.push(event);
+			});
+		});
+		const options = Object.freeze<ModelsSimpleStreamOptions>({
+			maxTokens: 17,
+			transformHeaders: async () => {
+				await Promise.resolve();
+				calls.push("caller:headers");
+				return { "x-caller": "yes" };
+			},
+			onPayload: async (_payload, requestModel) => {
+				await Promise.resolve();
+				calls.push("caller:payload");
+				callerModels.push(requestModel);
+				return { caller: true };
+			},
+			onResponse: async (_response, requestModel) => {
+				await Promise.resolve();
+				calls.push("caller:response");
+				callerModels.push(requestModel);
+			},
+			onProviderStreamEvent: async (_event, requestModel) => {
+				await Promise.resolve();
+				calls.push("caller:event");
+				callerModels.push(requestModel);
+			},
+		});
+		const originalOptions = { ...options };
+
+		const result = await runner.createContext().modelRegistry.complete(model, { messages: [] }, options);
+
+		expect(result.stopReason).toBe("stop");
+		expect(calls).toEqual([
+			"caller:headers",
+			"headers",
+			"caller:payload",
+			"payload",
+			"caller:response",
+			"response",
+			"caller:event",
+			"event",
+		]);
+		expect(sent).toEqual([
+			{ headers: { "x-caller": "yes", "x-hook": "yes" }, payload: { hook: true }, maxTokens: 17 },
+		]);
+		expect(observed).toEqual([
+			{ caller: true },
+			{ type: "after_provider_response", status: 201, headers: { "x-response": "yes" } },
+			{
+				type: "provider_stream_event",
+				data: { index: 1 },
+				provider: model.provider,
+				api: model.api,
+				model: model.id,
+			},
+		]);
+		expect(callerModels).toEqual([model, model, model]);
+		expect(options).toEqual(originalOptions);
+	});
+
+	it("installs hooks for stream", async () => {
+		const calls: string[] = [];
+		const runner = await createRunner((pi) => recordHooks(pi, calls));
+
+		const result = await runner.createContext().modelRegistry.stream(model, { messages: [] }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(calls).toEqual(["headers", "payload", "response", "event"]);
+	});
+
+	it("installs hooks once when streamSimple routes to a physical model", async () => {
+		const calls: string[] = [];
+		const runner = await createRunner((pi) => recordHooks(pi, calls));
+		const bound = runner.createContext().modelRegistry;
+		bound.registerVirtualModel({
+			provider: "router",
+			id: "auto",
+			name: "Auto",
+			route: () => ({ model, thinkingLevel: "off" }),
+		});
+
+		const result = await bound.streamSimple(bound.find("router", "auto")!, { messages: [] }).result();
+
+		expect(result.model).toBe(model.id);
+		expect(result.stopReason).toBe("stop");
+		expect(calls).toEqual(["headers", "payload", "response", "event"]);
+	});
+
+	it("installs image hooks without a stream callback", async () => {
 		const image: ImageModel<string> = {
 			type: "image",
 			id: "image",
-			name: "image",
-			api: "hook-images",
-			provider: "operations",
+			name: "Image",
+			api: "images",
+			provider: "images",
 			baseUrl: model.baseUrl,
 			input: ["text"],
 			output: ["image"],
 			cost: model.cost,
 		};
-		let streamCallbackInstalled: boolean | undefined;
-		runtime.registerProvider("operations", {
-			apiKey: "operations-key",
+		const calls: string[] = [];
+		let streamCallback: boolean | undefined;
+		registry.registerProvider(image.provider, {
+			apiKey: "test-key",
 			models: [image],
 			images: {
-				"hook-images": {
+				images: {
 					generateImages: async (requestModel, _context, options) => {
-						streamCallbackInstalled = Object.hasOwn(options ?? {}, "onProviderStreamEvent");
+						streamCallback = Object.hasOwn(options ?? {}, "onProviderStreamEvent");
 						await options?.onPayload?.({}, requestModel);
-						await options?.onResponse?.({ status: 201, headers: {} }, requestModel);
+						await options?.onResponse?.({ status: 200, headers: {} }, requestModel);
 						return {
 							api: requestModel.api,
 							provider: requestModel.provider,
@@ -133,54 +231,38 @@ describe("bound registry execution", () => {
 				},
 			},
 		});
-		const runner = await createRunner((pi) => recordHooks(pi, calls), registry);
+		const runner = await createRunner((pi) => recordHooks(pi, calls));
 
-		const result = await runner.createContext().modelRegistry.generateImages(
-			image,
-			{ input: [{ type: "text", text: "circle" }] },
-			{
-				onPayload: (_payload, requestModel) => {
-					callerModels.push(requestModel);
-				},
-				onResponse: (_response, requestModel) => {
-					callerModels.push(requestModel);
-				},
-			},
-		);
+		const result = await runner.createContext().modelRegistry.generateImages(image, { input: [] });
 
 		expect(result.stopReason).toBe("stop");
 		expect(calls).toEqual(["headers", "payload", "response"]);
-		expect(callerModels).toEqual([image, image]);
-		expect(streamCallbackInstalled).toBe(false);
-		const bound = runner.createContext().modelRegistry;
-		runner.invalidate();
-		expect(() => bound.generateImages(image, { input: [] })).toThrow("stale");
+		expect(streamCallback).toBe(false);
 	});
 
-	it("installs classifier hooks and forwards the model without a stream callback", async () => {
-		const calls: string[] = [];
-		const callerModels: ClassifierModel<string>[] = [];
+	it("installs classifier hooks without a stream callback", async () => {
 		const classifier: ClassifierModel<string> = {
 			type: "classifier",
 			id: "classifier",
-			name: "classifier",
-			api: "hook-classifier",
-			provider: "operations",
+			name: "Classifier",
+			api: "classifier",
+			provider: "classifier",
 			baseUrl: model.baseUrl,
 			input: ["text"],
 			cost: model.cost,
 			contextWindow: 1000,
 		};
-		let streamCallbackInstalled: boolean | undefined;
-		runtime.registerProvider("operations", {
-			apiKey: "operations-key",
+		const calls: string[] = [];
+		let streamCallback: boolean | undefined;
+		registry.registerProvider(classifier.provider, {
+			apiKey: "test-key",
 			models: [classifier],
 			classifiers: {
-				"hook-classifier": {
+				classifier: {
 					classify: async (requestModel, _context, options) => {
-						streamCallbackInstalled = Object.hasOwn(options ?? {}, "onProviderStreamEvent");
+						streamCallback = Object.hasOwn(options ?? {}, "onProviderStreamEvent");
 						await options?.onPayload?.({}, requestModel);
-						await options?.onResponse?.({ status: 201, headers: {} }, requestModel);
+						await options?.onResponse?.({ status: 200, headers: {} }, requestModel);
 						return {
 							api: requestModel.api,
 							provider: requestModel.provider,
@@ -193,82 +275,124 @@ describe("bound registry execution", () => {
 				},
 			},
 		});
-		const runner = await createRunner((pi) => recordHooks(pi, calls), registry);
+		const runner = await createRunner((pi) => recordHooks(pi, calls));
 
-		const result = await runner.createContext().modelRegistry.classify(
-			classifier,
-			{ state: {}, questions: {} },
-			{
-				onPayload: (_payload, requestModel) => {
-					callerModels.push(requestModel);
-				},
-				onResponse: (_response, requestModel) => {
-					callerModels.push(requestModel);
-				},
-			},
-		);
+		const result = await runner.createContext().modelRegistry.classify(classifier, { state: {}, questions: {} });
 
 		expect(result.stopReason).toBe("stop");
 		expect(calls).toEqual(["headers", "payload", "response"]);
-		expect(callerModels).toEqual([classifier, classifier]);
-		expect(streamCallbackInstalled).toBe(false);
-		const bound = runner.createContext().modelRegistry;
-		runner.invalidate();
-		expect(() => bound.classify(classifier, { state: {}, questions: {} })).toThrow("stale");
+		expect(streamCallback).toBe(false);
 	});
 
-	// Issue 13: inherited facade methods use the same runtime; only owned execution is overridden.
-	it("shares catalog, auth and registration without changing the original registry", async () => {
-		const calls: string[] = [];
-		const originalComplete = registry.complete;
-		const dispatched = Promise.withResolvers<SimpleStreamOptions | undefined>();
-		const runner = await createRunner((pi) => recordHooks(pi, calls), registry);
-		const bound = runner.createContext().modelRegistry;
-		bound.registerProvider(model.provider, {
-			api: model.api,
-			apiKey: "hook-key",
-			models: [model],
-			streamSimple: (_model, _context, options) => {
-				dispatched.resolve(options);
-				const result = createAssistantMessageEventStream();
-				result.end(message());
-				return result;
-			},
+	it.each([
+		{ replacement: null, expected: null },
+		{ replacement: undefined, expected: { original: true } },
+	])(
+		"uses the original payload only when the caller returns undefined ($replacement)",
+		async ({ replacement, expected }) => {
+			const observed: unknown[] = [];
+			const runner = await createRunner((pi) => {
+				pi.on("before_provider_request", (event) => {
+					observed.push(event.payload);
+				});
+			});
+			const options = composeProviderHooks<Model<string>, ModelsSimpleStreamOptions>(
+				model,
+				{ onPayload: async () => replacement },
+				runner,
+			);
+
+			const result = await options.onPayload!({ original: true }, model);
+
+			expect(result).toEqual(expected);
+			expect(observed).toEqual([expected]);
+		},
+	);
+
+	it("propagates caller failure without dispatching the payload hook", async () => {
+		const observed: unknown[] = [];
+		const runner = await createRunner((pi) => {
+			pi.on("before_provider_request", (event) => {
+				observed.push(event.payload);
+			});
 		});
-
-		expect(bound).not.toBe(registry);
-		expect(bound.find(model.provider, model.id)).toEqual(registry.find(model.provider, model.id));
-		expect(bound.getAll()).toEqual(registry.getAll());
-		expect(bound.getAvailable()).toEqual(registry.getAvailable());
-		expect(bound.getProvider(model.provider)).toEqual(registry.getProvider(model.provider));
-		expect(bound.getRegisteredProviderConfig(model.provider)).toEqual(
-			registry.getRegisteredProviderConfig(model.provider),
+		const failure = new Error("caller failed");
+		const options = composeProviderHooks<Model<string>, ModelsSimpleStreamOptions>(
+			model,
+			{
+				onPayload: async () => {
+					throw failure;
+				},
+			},
+			runner,
 		);
-		expect(bound.hasConfiguredAuth(model)).toBe(true);
-		expect(await bound.getApiKeyAndHeaders(model)).toEqual(await registry.getApiKeyAndHeaders(model));
-		expect(await bound.getApiKeyForProvider(model.provider)).toBe("hook-key");
-		await bound.refresh();
-		expect(bound.find(model.provider, model.id)).toEqual(registry.find(model.provider, model.id));
 
+		await expect(options.onPayload!({}, model)).rejects.toBe(failure);
+		expect(observed).toEqual([]);
+	});
+
+	it("rejects captured callbacks after invalidation even without handlers", async () => {
+		const runner = await createRunner(() => {});
+		const options = composeProviderHooks<Model<string>, ModelsSimpleStreamOptions>(model, undefined, runner);
 		runner.invalidate();
-		registry.streamSimple(model, { messages: [] });
-		const options = await dispatched.promise;
-		expect(options?.onPayload).toBeUndefined();
-		expect(options?.onResponse).toBeUndefined();
-		expect(options?.onProviderStreamEvent).toBeUndefined();
-		expect(calls).toEqual([]);
-		expect(registry.complete).toBe(originalComplete);
 
-		registry.registerVirtualModel({
+		await expect(options.transformHeaders!({})).rejects.toThrow("stale");
+		await expect(options.onPayload!({}, model)).rejects.toThrow("stale");
+		await expect(options.onResponse!({ status: 200, headers: {} }, model)).rejects.toThrow("stale");
+		await expect(options.onProviderStreamEvent!({}, model)).rejects.toThrow("stale");
+	});
+
+	it("allows an entered header hook to finish after invalidation", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const runner = await createRunner((pi) => {
+			pi.on("before_provider_headers", async (event) => {
+				entered.resolve();
+				await release.promise;
+				event.headers["x-finished"] = "yes";
+			});
+		});
+		const options = composeProviderHooks<Model<string>, ModelsSimpleStreamOptions>(model, undefined, runner);
+
+		const pending = options.transformHeaders!({});
+		await entered.promise;
+		runner.invalidate();
+		release.resolve();
+
+		await expect(pending).resolves.toEqual({ "x-finished": "yes" });
+	});
+
+	it("keeps stable runner bindings while sharing the original registry", async () => {
+		const owners: string[] = [];
+		const first = await createRunner((pi) => {
+			pi.on("before_provider_request", () => {
+				owners.push("A");
+			});
+		});
+		const second = await createRunner((pi) => {
+			pi.on("before_provider_request", () => {
+				owners.push("B");
+			});
+		});
+		const a = first.createContext().modelRegistry;
+		const b = second.createContext().modelRegistry;
+		expect(a).toBe(first.createCommandContext().modelRegistry);
+		expect(a).not.toBe(b);
+		a.registerVirtualModel({
 			provider: "router",
-			id: "auto",
-			name: "Auto",
+			id: "shared",
+			name: "Shared",
 			route: () => ({ model, thinkingLevel: "off" }),
 		});
-		expect(bound.find("router", "auto")).toEqual(registry.find("router", "auto"));
-		bound.unregisterVirtualModel("router", "auto");
-		expect(registry.find("router", "auto")).toBeUndefined();
-		bound.unregisterProvider(model.provider);
-		expect(registry.find(model.provider, model.id)).toBeUndefined();
+		expect(b.find("router", "shared")).toBe(registry.find("router", "shared"));
+		expect(b.find("router", "shared")).toBeDefined();
+
+		await a.complete(model, { messages: [] });
+		await b.complete(model, { messages: [] });
+		await a.complete(model, { messages: [] });
+		await registry.complete(model, { messages: [] });
+
+		expect(owners).toEqual(["A", "B", "A"]);
+		expect(sent).toHaveLength(4);
 	});
 });
