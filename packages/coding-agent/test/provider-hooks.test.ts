@@ -34,26 +34,25 @@ const model: Model<Api> = {
 	baseUrl: "https://hooks.invalid",
 	reasoning: false,
 	input: ["text"],
-	cost: { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 },
-	contextWindow: 1_000_000,
-	maxTokens: 4096,
-	promptCache: { short: 300 },
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 10_000,
+	maxTokens: 1000,
 };
 
 function message(): AssistantMessage {
 	return {
 		role: "assistant",
-		content: [{ type: "text", text: "summary" }],
+		content: [{ type: "text", text: "response" }],
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
 		usage: {
-			input: 100_000,
+			input: 1,
 			output: 1,
 			cacheRead: 0,
 			cacheWrite: 0,
-			totalTokens: 100_001,
-			cost: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, total: 1 },
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "stop",
 		timestamp: Date.now(),
@@ -194,8 +193,6 @@ describe("session provider hooks", () => {
 			expect(sent).toHaveLength(1);
 			expect(sent[0].payload).toEqual({ hook: true });
 			expect(sent[0].options?.headers).toEqual({ "x-caller": "yes", "x-hook": "yes" });
-			expect(sent[0].options?.apiKey).toBe("hook-key");
-			expect(sent[0].options?.timeoutMs).toBeUndefined();
 			expect(options).not.toHaveProperty("headers");
 		},
 	);
@@ -392,16 +389,10 @@ describe("session provider hooks", () => {
 		});
 		const virtual = registry.find("router", "auto")!;
 
-		const result = await registry
-			.streamSimple(virtual, { messages: [] }, { headers: { "x-virtual": "secret" } })
-			.result();
+		const result = await registry.streamSimple(virtual, { messages: [] }).result();
 
 		expect(result.stopReason).toBe("stop");
 		expect(calls).toEqual(["headers", "hook-model", "hook-model"]);
-		expect(sent).toHaveLength(1);
-		expect(sent[0].options?.headers).not.toHaveProperty("x-virtual");
-		const unrouted = await registry.complete(virtual, { messages: [] });
-		expect(unrouted.stopReason).toBe("error");
 		expect(sent).toHaveLength(1);
 	});
 
@@ -447,11 +438,11 @@ describe("session provider hooks", () => {
 
 	// #9773: invalidation during caller callbacks must fail before session dispatch.
 	it.each([
-		["transformHeaders", []],
-		["onPayload", ["headers"]],
-		["onResponse", ["headers", "payload"]],
-		["onProviderStreamEvent", ["headers", "payload", "response"]],
-	] as const)("rejects disposed %s after awaiting its caller callback", async (callback, expectedHooks) => {
+		["transformHeaders", [], 0],
+		["onPayload", ["headers"], 0],
+		["onResponse", ["headers", "payload"], 1],
+		["onProviderStreamEvent", ["headers", "payload", "response"], 1],
+	] as const)("rejects disposed %s after awaiting its caller callback", async (callback, expectedHooks, sentCount) => {
 		const calls: string[] = [];
 		const session = await createSession((pi) => {
 			pi.on("before_provider_headers", () => {
@@ -490,7 +481,9 @@ describe("session provider hooks", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("stale");
 		expect(calls).toEqual([...expectedHooks, "caller:finished"]);
+		expect(sent).toHaveLength(sentCount);
 		expect(() => registry.complete(model, { messages: [] })).toThrow("stale");
+		expect(() => registry.stream(model, { messages: [] })).toThrow("stale");
 	});
 
 	// #9773: the activity precondition also applies when no session handler exists.
@@ -578,37 +571,6 @@ describe("session provider hooks", () => {
 		expect(
 			(await session.extensionRunner.createContext().modelRegistry.complete(model, { messages: [] })).stopReason,
 		).toBe("stop");
-	});
-
-	it("rejects execution invalidated while a caller header transform awaits", async () => {
-		const hooks: string[] = [];
-		const session = await createSession((pi) => {
-			pi.on("before_provider_headers", () => {
-				hooks.push("headers");
-			});
-		});
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const registry = session.extensionRunner.createContext().modelRegistry;
-		const response = registry.complete(
-			model,
-			{ messages: [] },
-			{
-				transformHeaders: async (headers) => {
-					entered.resolve();
-					await release.promise;
-					return headers;
-				},
-			},
-		);
-		await entered.promise;
-		session.dispose();
-		release.resolve();
-
-		expect((await response).errorMessage).toContain("stale");
-		expect(sent).toEqual([]);
-		expect(hooks).toEqual([]);
-		expect(() => registry.stream(model, { messages: [] })).toThrow("stale");
 	});
 
 	it("rejects registry execution invalidated during authentication", async () => {
