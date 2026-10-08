@@ -434,27 +434,60 @@ describe("session provider hooks", () => {
 		});
 
 		// #9773: the activity precondition also applies when no session handler exists.
-		it.each(["transformHeaders", "onPayload", "onResponse", "onProviderStreamEvent"] as const)(
-			"rejects stale %s even without registered handlers",
-			async (callback) => {
+		it.each([
+			{ callback: "transformHeaders", nextCallback: "onPayload", sentCount: 0 },
+			{ callback: "onPayload", nextCallback: "onResponse", sentCount: 0 },
+			{ callback: "onResponse", nextCallback: "onProviderStreamEvent", sentCount: 1 },
+		])(
+			"rejects stale $callback before $nextCallback even without registered handlers",
+			async ({ callback, nextCallback, sentCount }) => {
 				const session = await createSession(() => {});
 				const registry = session.extensionRunner.createContext().modelRegistry;
+				const calls: string[] = [];
 
 				const result = await registry.complete(
 					model,
 					{ messages: [] },
 					{
 						[callback]: async (value: unknown) => {
+							calls.push("caller:dispose");
 							session.dispose();
 							return value;
+						},
+						[nextCallback]: async () => {
+							calls.push("caller:next");
 						},
 					},
 				);
 
 				expect(result.stopReason).toBe("error");
 				expect(result.errorMessage).toContain("stale");
+				expect(calls).toEqual(["caller:dispose"]);
+				expect(sent).toHaveLength(sentCount);
 			},
 		);
+
+		// #9773: stream events repeat the same callback; no second caller entry may occur.
+		it("rejects the first stale stream event even without registered handlers", async () => {
+			const session = await createSession(() => {});
+			const registry = session.extensionRunner.createContext().modelRegistry;
+			const events: unknown[] = [];
+
+			const result = await registry.complete(
+				model,
+				{ messages: [] },
+				{
+					onProviderStreamEvent: async (data) => {
+						events.push(data);
+						session.dispose();
+					},
+				},
+			);
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("stale");
+			expect(events).toEqual([{ index: 1 }]);
+		});
 
 		// #9773: an entered hook may finish; activity is checked on the next callback's entry.
 		it.each([

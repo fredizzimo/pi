@@ -17,7 +17,7 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
-import { bindModelRegistry, type ProviderHooks } from "../provider-hooks.ts";
+import { bindModelRegistry } from "../provider-hooks.ts";
 import type { SessionManager } from "../session-manager.ts";
 import {
 	type BuildSystemPromptOptions,
@@ -390,33 +390,6 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
-	private readonly providerHooks: ProviderHooks = {
-		transformHeaders: async (headers) => {
-			this.assertActive();
-			return this.hasHandlers("before_provider_headers") ? this.emitBeforeProviderHeaders(headers) : headers;
-		},
-		onPayload: async (payload) => {
-			this.assertActive();
-			if (!this.hasHandlers("before_provider_request")) return payload;
-			return this.emitBeforeProviderRequest(payload);
-		},
-		onResponse: async (response) => {
-			this.assertActive();
-			if (!this.hasHandlers("after_provider_response")) return;
-			await this.emit({ type: "after_provider_response", status: response.status, headers: response.headers });
-		},
-		onProviderStreamEvent: async (data, model) => {
-			this.assertActive();
-			if (!this.hasHandlers("provider_stream_event")) return;
-			await this.emit({
-				type: "provider_stream_event",
-				data,
-				provider: model.provider,
-				api: model.api,
-				model: model.id,
-			});
-		},
-	};
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
 
@@ -432,7 +405,7 @@ export class ExtensionRunner {
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
-		this.modelRegistry = bindModelRegistry(modelRegistry, this.providerHooks, this.assertActive.bind(this));
+		this.modelRegistry = bindModelRegistry(modelRegistry, this);
 	}
 
 	bindCore(
@@ -756,7 +729,7 @@ export class ExtensionRunner {
 		}
 	}
 
-	private assertActive(): void {
+	assertActive(): void {
 		if (this.staleMessage) {
 			throw new Error(this.staleMessage);
 		}

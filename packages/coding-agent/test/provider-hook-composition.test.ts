@@ -1,6 +1,13 @@
 import type { Api, Model, ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import { AuthStorage } from "../src/core/auth-storage.ts";
+import { createEventBus } from "../src/core/event-bus.ts";
+import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
+import { ExtensionRunner } from "../src/core/extensions/runner.ts";
+import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { composeProviderHooks } from "../src/core/provider-hooks.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 
 const model: Model<Api> = {
 	id: "hook-model",
@@ -14,6 +21,14 @@ const model: Model<Api> = {
 	contextWindow: 1000,
 	maxTokens: 100,
 };
+
+async function createRunner(factory: ExtensionFactory): Promise<ExtensionRunner> {
+	const cwd = process.cwd();
+	const runtime = createExtensionRuntime();
+	const extension = await loadExtensionFromFactory(factory, cwd, createEventBus(), runtime);
+	const registry = await createInMemoryModelRegistry(AuthStorage.inMemory());
+	return new ExtensionRunner([extension], runtime, cwd, SessionManager.inMemory(cwd), registry);
+}
 
 const callbackCases = [
 	{
@@ -34,21 +49,22 @@ const callbackCases = [
 	},
 ];
 
-// #9773: detailed composition rules need only local callbacks, not an SDK session.
+// #9773: exercise composition with local inputs and a real runner, without SDK sessions or provider dispatch.
 describe("provider hook composition", () => {
 	it("passes replacement headers to the hook without modifying caller options", async () => {
 		const original = { "x-original": "yes" };
 		const replacement = { "x-caller": "yes" };
 		const observed: unknown[] = [];
+		const runner = await createRunner((pi) => {
+			pi.on("before_provider_headers", (event) => {
+				observed.push(event.headers);
+				event.headers["x-hook"] = "yes";
+			});
+		});
 		const callerOptions: ModelsSimpleStreamOptions = Object.freeze({
 			transformHeaders: async () => replacement,
 		});
-		const composed = composeProviderHooks(model, callerOptions, {
-			transformHeaders: (headers) => {
-				observed.push(headers);
-				return { ...headers, "x-hook": "yes" };
-			},
-		});
+		const composed = composeProviderHooks(model, callerOptions, runner);
 
 		const result = await composed.transformHeaders!(original);
 
@@ -63,6 +79,12 @@ describe("provider hook composition", () => {
 	it.each([null, false, 0, "", undefined])("preserves caller payload replacement %s", async (replacement) => {
 		const payload = { original: true, mutated: false };
 		const observed: unknown[] = [];
+		const runner = await createRunner((pi) => {
+			pi.on("before_provider_request", (event) => {
+				observed.push(event.payload);
+				return event.payload;
+			});
+		});
 		const composed = composeProviderHooks<Model<Api>, ModelsSimpleStreamOptions>(
 			model,
 			{
@@ -71,33 +93,29 @@ describe("provider hook composition", () => {
 					return replacement;
 				},
 			},
-			{
-				onPayload: (value, requestModel) => {
-					observed.push(value, requestModel);
-					return value;
-				},
-			},
+			runner,
 		);
 
 		const result = await composed.onPayload!(payload, model);
 
 		const expected = replacement === undefined ? payload : replacement;
 		expect(result).toBe(expected);
-		expect(observed).toEqual([expected, model]);
+		expect(observed).toEqual([expected]);
 		expect(payload.mutated).toBe(true);
 	});
 
 	it("returns the hook's payload replacement after the caller replacement", async () => {
 		const observed: unknown[] = [];
+		const runner = await createRunner((pi) => {
+			pi.on("before_provider_request", (event) => {
+				observed.push(event.payload);
+				return { hook: true };
+			});
+		});
 		const composed = composeProviderHooks<Model<Api>, ModelsSimpleStreamOptions>(
 			model,
 			{ onPayload: () => ({ caller: true }) },
-			{
-				onPayload: (payload) => {
-					observed.push(payload);
-					return { hook: true };
-				},
-			},
+			runner,
 		);
 
 		const result = await composed.onPayload!({ original: true }, model);
@@ -116,6 +134,15 @@ describe("provider hook composition", () => {
 			await release.promise;
 			calls.push("caller:finished");
 		};
+		const runner = await createRunner((pi) => {
+			const handler = () => {
+				calls.push("hook");
+			};
+			pi.on("before_provider_headers", handler);
+			pi.on("before_provider_request", handler);
+			pi.on("after_provider_response", handler);
+			pi.on("provider_stream_event", handler);
+		});
 		const composed = composeProviderHooks<Model<Api>, ModelsSimpleStreamOptions>(
 			model,
 			{
@@ -130,22 +157,7 @@ describe("provider hook composition", () => {
 				onResponse: caller,
 				onProviderStreamEvent: caller,
 			},
-			{
-				transformHeaders: (headers) => {
-					calls.push("hook");
-					return headers;
-				},
-				onPayload: (payload) => {
-					calls.push("hook");
-					return payload;
-				},
-				onResponse: () => {
-					calls.push("hook");
-				},
-				onProviderStreamEvent: () => {
-					calls.push("hook");
-				},
-			},
+			runner,
 		);
 
 		const pending = invoke(composed);
@@ -163,25 +175,19 @@ describe("provider hook composition", () => {
 		const caller = async () => {
 			throw failure;
 		};
+		const runner = await createRunner((pi) => {
+			const handler = () => {
+				calls.push("hook");
+			};
+			pi.on("before_provider_headers", handler);
+			pi.on("before_provider_request", handler);
+			pi.on("after_provider_response", handler);
+			pi.on("provider_stream_event", handler);
+		});
 		const composed = composeProviderHooks<Model<Api>, ModelsSimpleStreamOptions>(
 			model,
 			{ transformHeaders: caller, onPayload: caller, onResponse: caller, onProviderStreamEvent: caller },
-			{
-				transformHeaders: (headers) => {
-					calls.push("hook");
-					return headers;
-				},
-				onPayload: (payload) => {
-					calls.push("hook");
-					return payload;
-				},
-				onResponse: () => {
-					calls.push("hook");
-				},
-				onProviderStreamEvent: () => {
-					calls.push("hook");
-				},
-			},
+			runner,
 		);
 
 		await expect(invoke(composed)).rejects.toBe(failure);
